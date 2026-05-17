@@ -236,20 +236,6 @@ def _load_layout(
 def _swiglu_split_layout(
     block_m: int, block_n_full: int, num_warps: int
 ) -> gl.constexpr:
-    """Build a ``BlockedLayout`` whose last-axis registers come in pairs,
-    so that ``reshape([..., 2]) -> split`` lowers to a free lane swap.
-
-    ``block_n_full = 2 * OUT_BLOCK_N`` is the GEMM accumulator N width
-    BEFORE the swiglu halve. We use ``size_per_thread = [1, 4]`` so each
-    thread holds two ``(gate, linear)`` pairs in adjacent registers; the
-    new innermost axis after reshape lives entirely in registers and the
-    split can lower to a zero-cost SliceLayout pick.
-
-    The fixed natural per-CTA tile is ``[2 * num_warps, 128]`` (i.e.
-    8 warps -> [16, 128]); both BLOCK_M and BLOCK_N replicate over this
-    tile when bigger, which is fine for split (each replica holds an
-    independent fragment with its own (gate, linear) pairs).
-    """
     THREADS_PER_WARP = 64  # CDNA4 wavefront size.
     return gl.BlockedLayout(
         size_per_thread=[1, 4],
@@ -267,23 +253,6 @@ def _swiglu_reduce(
     OUT_BLOCK_N: gl.constexpr,
     MMA: gl.constexpr,
 ):
-    """SwiGLU (gated GELU) reduction along the inner-most axis.
-
-    The accumulator has shape ``[BLOCK_M, 2 * OUT_BLOCK_N]``; pairs of
-    adjacent N-columns are interpreted as ``(gate, linear)``. We split
-    them along the last axis and apply the canonical
-    ``s = gate / (1 + exp(-alpha * gate))`` mixing rule.
-
-    The MFMA-scaled accumulator layout on CDNA4 places adjacent N
-    elements in DIFFERENT lanes, so a naive
-    ``reshape -> split`` fails to infer a SliceLayout for the new
-    innermost axis (``gl.split`` requires the split axis to live in
-    registers). We pre-convert the accumulator to a ``BlockedLayout``
-    with ``size_per_thread = [1, 4]`` along N so adjacent N-elements
-    sit in the same thread's registers; the reshape then folds the
-    inner ``2`` axis into registers and ``gl.split`` becomes a free
-    lane pick.
-    """
     BLOCK_M: gl.constexpr = acc.shape[0]
     BLOCK_N_FULL: gl.constexpr = acc.shape[1]
     SPLIT_LAYOUT: gl.constexpr = _swiglu_split_layout(
@@ -466,6 +435,7 @@ class MoEConfig:
     EVEN_K: gl.constexpr
     USE_GATHER: gl.constexpr
     USE_MFMA_SCALED: gl.constexpr
+    NUM_LOADS_IN_BATCH: gl.constexpr
 
     shared_layout_x: gl.constexpr
     dot_layout_x: gl.constexpr
@@ -553,6 +523,13 @@ class MoEConfig:
         )
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
 
+        num_loads = 2  # x and w
+        if WITH_X_MX_SCALE:
+            num_loads += 1
+        if WITH_W_MX_SCALE:
+            num_loads += 1
+        self.NUM_LOADS_IN_BATCH = gl.constexpr(num_loads)
+
         BLOCK_K_SCALE = BLOCK_K // SCALE_BLOCK
         self.index_type = gl.constexpr(index_type)
 
@@ -639,12 +616,14 @@ class MoEConfig:
         # ``W_TRANSPOSE`` (True -> ``[BN, BK_packed]``,
         # False -> ``[BK_packed, BN]``).  Packed-K accounts for e2m1's
         # 2-per-byte storage.
-        BLOCK_K_PACKED_X_HOST = int(BLOCK_K) // (2 if DTYPE_X == "e2m1" else 1)
-        BLOCK_K_PACKED_W_HOST = int(BLOCK_K) // (2 if DTYPE_W == "e2m1" else 1)
+        BLOCK_K_PACKED_X_HOST = BLOCK_K // self.DIV_FACTOR_X
+        BLOCK_K_PACKED_W_HOST = BLOCK_K // self.DIV_FACTOR_W
 
-        def _row_major_offsets(H: int, W: int):
-            inner = [[0, 1 << i] for i in range((W).bit_length() - 1)]
-            outer = [[1 << i, 0] for i in range((H).bit_length() - 1)]
+        def _row_major_offsets(H, W):
+            H = int(H)
+            W = int(W)
+            inner = [[0, 1 << i] for i in range(W.bit_length() - 1)]
+            outer = [[1 << i, 0] for i in range(H.bit_length() - 1)]
             return inner + outer
 
         self.shared_layout_x = gl.constexpr(
@@ -740,12 +719,11 @@ class MoEProgramBase:
                 self.x_scale_desc.issue_async_load(load_idx, self.x_scale_buffer, pred)
             if cfg.WITH_W_MX_SCALE:
                 self.w_scale_desc.issue_async_load(load_idx, self.w_scale_buffer, pred)
-        gl.amd.cdna4.async_copy.commit_group()
         return load_idx + 1
 
     @gluon.jit
     def async_wait(self, waitcnt):
-        gl.amd.cdna4.async_copy.wait_group(waitcnt)
+        gl.amd.cdna4.async_copy.wait_group(waitcnt * self.cfg.NUM_LOADS_IN_BATCH)
 
 
 @gluon.constexpr_function
@@ -881,6 +859,22 @@ class AsyncCopyDescriptor:
                 offsets,
             )
         else:
+            # NOTE: do NOT pass ``other=0``. Gluon's ``buffer_load_to_shared``
+            # routes ``other`` straight into ``ttag.BufferLoadToLocalOp``
+            # (gluon_ir.cc:create_buffer_load_to_local), bypassing the
+            # ``ConvertTritonLoadToBufferLoad`` ``isZeroConst(other)`` strip.
+            # With a non-null ``other`` operand, the LLVM lowering
+            # (LoadStoreOpToLLVM.cpp BufferLoadToLocalOpConversion) emits
+            # ``cond = threadPred AND maskElem`` and ``emitBranch(cond)`` per
+            # vector load -- per-element ``br i1`` blocks around every
+            # ``buffer.load.async.lds``. Those branches prevent LLVM's
+            # ``SIInsertWaitcnts`` from statically counting in-flight vmem,
+            # so ``wait_asyncmark(N)`` collapses to ``s_waitcnt vmcnt(0)``
+            # and kills the async pipeline depth on CDNA4. With ``other``
+            # omitted the lowering uses ``cond = threadPred`` (warp-uniform),
+            # leaving straight-line loads; masked-out lanes still issue the
+            # load and rely on the buffer-descriptor's ``numRecords`` OOB
+            # check to write 0 to LDS for out-of-range offsets.
             mask_k = gl.expand_dims(off_k_step + self.off_k, self.op_idx) < self.k_limit
             mask = mask_k & self.masks_nonk
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -888,18 +882,31 @@ class AsyncCopyDescriptor:
                 self.ptr,
                 offsets,
                 mask=mask,
-                other=0,
             )
+        gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
     def issue_local_load(
         self, idx, buffer, layout: gl.constexpr, do_permute: gl.constexpr = False
     ):
+        # ``load_shared_relaxed`` (vs the bare ``slot.load``) is critical
+        # on CDNA4: it sets the ``ttg.amdg.syncedViaAsyncWait=true``
+        # attribute on the lowered ``ttg.local_load`` so AMD's
+        # ``membarFilter`` (MembarUtility.cpp) suppresses the redundant
+        # ``s_barrier`` between our ``buffer_load_to_local`` and this
+        # consumer. Without that suppression, ``SIInsertWaitcnts`` lifts
+        # the ``s_waitcnt vmcnt(N)`` we asked for via ``async_wait(N)`` to
+        # ``s_waitcnt vmcnt(0)`` (required for cross-wave LDS visibility
+        # at the barrier), collapsing the async pipeline depth to 1.
+        # gfx1250 (RDNA4) has a separate hw async-cnt and doesn't need
+        # this dance -- that's why ``moe_gfx1250.py`` uses bare
+        # ``slot.load``; the CDNA4 reference ``f16_gemm_gfx950.py`` uses
+        # ``load_shared_relaxed`` everywhere.
         NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
         slot = buffer.index(idx % NUM_BUFFERS)
         if do_permute:
             slot = slot.permute([1, 0])
-        return slot.load(layout=layout)
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot, layout)
 
     @gluon.jit
     def issue_local_load_unswizzle(
@@ -929,7 +936,8 @@ class AsyncCopyDescriptor:
         )
         slot_perm = slot_5d.permute((0, 3, 2, 1, 4))
         slot_2d = slot_perm.reshape((BLOCK_NONK, BLOCK_K_SCALE))
-        return slot_2d.load(layout=layout)
+        # See ``issue_local_load`` for why we need ``load_shared_relaxed``.
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_2d, layout)
 
     @gluon.jit
     def issue_local_load_unswizzle_cdna4_upstream(
@@ -952,7 +960,8 @@ class AsyncCopyDescriptor:
         slot_7d = slot.reshape((BLOCK_NONK_PS, BLOCK_K_SCALE // 8, 4, 16, 2, 2, 1))
         slot_perm = slot_7d.permute((0, 5, 3, 1, 4, 2, 6))
         slot_2d = slot_perm.reshape((BLOCK_NONK, BLOCK_K_SCALE))
-        return slot_2d.load(layout=layout)
+        # See ``issue_local_load`` for why we need ``load_shared_relaxed``.
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_2d, layout)
 
     @gluon.jit
     def issue_local_load_unswizzle_sub(
@@ -999,7 +1008,10 @@ class AsyncCopyDescriptor:
                 .permute((0, 3, 2, 1, 4))
                 .reshape((BLOCK_NONK, BLOCK_K_SCALE))
             )
-        return slot_view.slice(subtile_start_nonk, SUBTILE_NONK, 0).load(layout=layout)
+        # See ``issue_local_load`` for why we need ``load_shared_relaxed``.
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(
+            slot_view.slice(subtile_start_nonk, SUBTILE_NONK, 0), layout
+        )
 
 
 @gluon.jit
@@ -1562,7 +1574,11 @@ class MoESliceMNKProgram:
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
 
         slot = self.x_buffer.index(mfma_idx % cfg.NUM_BUFFERS)
-        x = slot.slice(subtile_start_m, SUBTILE_M, 0).load(layout=cfg.dot_layout_x)
+        # See ``MoEProgramBase.issue_local_load`` for why we need
+        # ``load_shared_relaxed`` (CDNA4 async_wait + s_barrier dance).
+        x = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            slot.slice(subtile_start_m, SUBTILE_M, 0), cfg.dot_layout_x
+        )
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
@@ -1605,14 +1621,17 @@ class MoESliceMNKProgram:
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
 
         slot = self.w_buffer.index(mfma_idx % cfg.NUM_BUFFERS)
+        # See ``MoEProgramBase.issue_local_load`` for why we need
+        # ``load_shared_relaxed`` (CDNA4 async_wait + s_barrier dance).
         if cfg.W_TRANSPOSE:
-            w = (
-                slot.slice(subtile_start_n, SUBTILE_N, 0)
-                .permute([1, 0])
-                .load(layout=cfg.dot_layout_w)
+            w = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                slot.slice(subtile_start_n, SUBTILE_N, 0).permute([1, 0]),
+                cfg.dot_layout_w,
             )
         else:
-            w = slot.slice(subtile_start_n, SUBTILE_N, 1).load(layout=cfg.dot_layout_w)
+            w = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                slot.slice(subtile_start_n, SUBTILE_N, 1), cfg.dot_layout_w
+            )
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_W_MX_SCALE:
@@ -2230,8 +2249,6 @@ def _pipelined_moe_kernel_scaled(
     expert_remap_ptr,
     slice_offs_ptr,
     slice_sizes_ptr,
-    block_offs_ptr,
-    block_schedule_ptr,
     stride_xm,
     stride_xk,
     stride_we,
@@ -2281,44 +2298,31 @@ def _pipelined_moe_kernel_scaled(
     USE_WARP_PIPELINE: gl.constexpr = False,
     USE_SLICE_MNK: gl.constexpr = False,
     USE_3STAGE_PIPELINE: gl.constexpr = False,
-    PERSISTENT: gl.constexpr = False,
-    USE_BLOCK_SCHEDULE: gl.constexpr = False,
-    N_EXPTS_TOT: gl.constexpr = 0,
     GRID_N: gl.constexpr = 0,
     GROUP_M: gl.constexpr = 1,
     XCD_SWIZZLE: gl.constexpr = 1,
 ):
-    """Top-level MoE GEMM kernel. Iteration mode is constexpr-selected:
+    """Non-persistent MoE GEMM kernel: legacy 2-D grid, one tile per CTA.
 
-    - ``USE_BLOCK_SCHEDULE``: 1-D grid driven by the device-side ragged
-      schedule (graph-capturable). ``block_schedule[pid_m]`` packs
-      ``(block_in_expert << 16) | expert_id``; entries past
-      ``block_offs[N_EXPTS_TOT]`` are padding and cheap-skipped.
-    - ``PERSISTENT``: 1-D grid; each CTA strides through ``NUM_TILES``.
-    - Otherwise: legacy 2-D grid ``(block_pid, compact_idx)``.
+    The kernel is straight-line -- no constexpr-collapsed for-loop, no
+    schedule-padding ``do_tile`` guard around the body -- so LLVM sees
+    a single basic block per launch and register-allocates accordingly.
+    Iterative launch flavours (persistent / block-schedule) live in
+    :mod:`.gluon_persistent` to keep this entry point lean.
 
-    All three paths funnel into a single ``_pipelined_moe_tile_compute``.
+    Grid: ``(blocks_per_expert * grid_n, num_active)``.
+      * ``program_id(0)`` is the intra-(expert) tile id.
+      * ``program_id(1)`` is the compact expert id (in
+        ``[0, num_active)`` -- ``HAS_EXPERT_REMAP`` then maps to the
+        real expert id inside :func:`_pipelined_moe_tile_compute`).
 
-    ``GRID_N`` is passed as constexpr (``= ceil_div(N, BLOCK_N)``) so the
-    schedule-mode ``tile_idx // GRID_N`` and ``tile_idx % GRID_N`` lower
-    to fast magic-mul/shift instead of a runtime integer div. This drops
-    ~30 SGPRs of live state in the schedule path on the prefill BM=128
-    tile and is what eliminates the [SPILL] tag there. The launcher
-    always knows ``grid_n`` (it's the same value used to size the kernel
-    grid), so the constexpr is free. ``GRID_N=0`` is a sentinel for
-    older call sites and falls back to the runtime compute.
+    ``GRID_N`` is passed as constexpr (``= ceil_div(N, BLOCK_N)``) so
+    ``tiles_per_expert`` lowers to a compile-time constant; ``GRID_N=0``
+    falls back to the runtime compute for legacy call sites.
 
-    ``GROUP_M``/``XCD_SWIZZLE`` (Update 9 #2): ``GROUP_M`` re-orders the
-    intra-expert ``(block_in_expert, pid_n)`` walk so ``GROUP_M``
-    consecutive M-tiles share a pid_n (= same W column tile across L2)
-    -- this is the classic GEMM L2-reuse swizzle. ``XCD_SWIZZLE``
-    permutes the linear domain so consecutive original pids land on the
-    same XCD (MI355X has 8 XCDs, each with a private slice of L2);
-    combined with ``GROUP_M`` it concentrates the W-tile reuse INTO one
-    XCD's L2 instead of spilling across all 8. Both default to
-    no-op (1) so existing benchmarks reproduce; the launcher's
-    ``_autotune_pid_swizzle`` picks ``(GROUP_M=4, XCD_SWIZZLE=8)`` on
-    prefill-shaped problems (large ``num_tiles``).
+    ``GROUP_M`` / ``XCD_SWIZZLE`` are launcher-side knobs that re-order
+    ``tile_idx`` for L2 reuse and XCD locality respectively; both
+    default to no-op (1).
     """
     if GRID_N > 0:
         grid_n: gl.constexpr = GRID_N
@@ -2327,134 +2331,81 @@ def _pipelined_moe_kernel_scaled(
         grid_n = (N + BLOCK_N - 1) // BLOCK_N
         tiles_per_expert = BLOCKS_PER_EXPERT * grid_n
 
-    # Pick loop bounds: persistent + schedule walk NUM_TILES with stride
-    # num_pids; legacy 2-D grid is one tile per CTA (encoded as a 1-iter
-    # range so the body is shared).
-    if PERSISTENT or USE_BLOCK_SCHEDULE:
-        loop_start = gl.program_id(0)
-        loop_stop = NUM_TILES
-        loop_step = gl.num_programs(0)
-    else:
-        loop_start = gl.program_id(1) * tiles_per_expert + gl.program_id(0)
-        loop_stop = loop_start + 1
-        loop_step = 1
+    # tile_idx packs (compact_idx, intra-expert pid). XCD swizzle on the
+    # FULL domain so the permutation crosses experts; GROUP_M then
+    # re-orders within an expert's (BLOCKS_PER_EXPERT, grid_n) sub-grid
+    # for W-tile L2 reuse.
+    tile_idx = gl.program_id(1) * tiles_per_expert + gl.program_id(0)
+    swizzled = _xcd_chiplet_swizzle(tile_idx, NUM_TILES, XCD_SWIZZLE)
+    compact_idx = swizzled // tiles_per_expert
+    local = swizzled % tiles_per_expert
+    block_in_expert, pid_n = _group_m_swizzle(local, BLOCKS_PER_EXPERT, grid_n, GROUP_M)
 
-    # Schedule mode: load the unpadded-tile count once for early-skip.
-    # ``unpadded_m`` (== actual_total / grid_n) is the post-swizzle bound
-    # we check against ``pid_m``. The pre-swizzle ``actual_total`` is
-    # *not* a valid early-skip key once GROUP_M/XCD_SWIZZLE re-orders
-    # ``tile_idx`` -- a raw ``tile_idx < actual_total`` check would let
-    # a permuted-INTO-padded-slot tile pass while skipping a permuted-
-    # OUT-of-real-region one (memfault on schedule lookup).
-    if USE_BLOCK_SCHEDULE:
-        unpadded_m = gl.load(block_offs_ptr + N_EXPTS_TOT).to(gl.int32)
-
-    # Schedule entries already encode the real expert_id, so the tile
-    # compute must skip the expert_remap[] lookup in that mode.
-    TILE_HAS_EXPERT_REMAP: gl.constexpr = HAS_EXPERT_REMAP and not USE_BLOCK_SCHEDULE
-
-    for tile_idx in range(loop_start, loop_stop, loop_step):
-        if USE_BLOCK_SCHEDULE:
-            # Schedule mode: the whole 1-D domain is ``NUM_TILES`` =
-            # grid_m_padded * grid_n. XCD swizzle on the full domain
-            # + GROUP_M swizzle on (grid_m_padded, grid_n) to map to
-            # ``(pid_m_block, pid_n)``. The schedule is keyed by
-            # ``pid_m_block`` -- any permutation of the iteration
-            # order is correctness-preserving (each ``pid_m_block``
-            # is still processed exactly once). The do_tile check must
-            # happen on ``pid_m`` (post-swizzle), not on ``tile_idx``.
-            swizzled = _xcd_chiplet_swizzle(tile_idx, NUM_TILES, XCD_SWIZZLE)
-            grid_m_padded = NUM_TILES // grid_n
-            pid_m, pid_n = _group_m_swizzle(swizzled, grid_m_padded, grid_n, GROUP_M)
-            do_tile = pid_m < unpadded_m
-        else:
-            do_tile = True
-
-        if do_tile:
-            if USE_BLOCK_SCHEDULE:
-                schedule_raw = gl.load(block_schedule_ptr + pid_m).to(
-                    gl.uint32, bitcast=True
-                )
-                compact_idx = (schedule_raw & 0x0000FFFF).to(gl.int32)
-                block_in_expert = (schedule_raw >> 16).to(gl.int32)
-            else:
-                # Legacy / persistent: tile_idx packs (compact_idx, intra
-                # -expert pid). XCD swizzle on the FULL domain so the
-                # mapping permutes across experts too. GROUP_M only
-                # applies WITHIN one expert's (BLOCKS_PER_EXPERT, grid_n)
-                # sub-grid (W tile only reusable for same expert).
-                swizzled = _xcd_chiplet_swizzle(tile_idx, NUM_TILES, XCD_SWIZZLE)
-                compact_idx = swizzled // tiles_per_expert
-                local = swizzled % tiles_per_expert
-                block_in_expert, pid_n = _group_m_swizzle(
-                    local, BLOCKS_PER_EXPERT, grid_n, GROUP_M
-                )
-
-            _pipelined_moe_tile_compute(
-                x_ptr,
-                w_ptr,
-                x_scale_ptr,
-                w_scale_ptr,
-                bias_ptr,
-                y_ptr,
-                gather_idx_ptr,
-                scatter_idx_ptr,
-                gate_scal_ptr,
-                expert_remap_ptr,
-                slice_offs_ptr,
-                slice_sizes_ptr,
-                stride_xm,
-                stride_xk,
-                stride_we,
-                stride_wn,
-                stride_wk,
-                stride_xsm,
-                stride_xsk,
-                stride_wse,
-                stride_wsn,
-                stride_wsk,
-                stride_yn,
-                stride_ym,
-                stride_be,
-                stride_bn,
-                M,
-                M_X,
-                N,
-                K,
-                x_global_scale_ptr,
-                compact_idx,
-                block_in_expert,
-                pid_n,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                BLOCK_K=BLOCK_K,
-                BLOCKS_PER_EXPERT=BLOCKS_PER_EXPERT,
-                X_FORMAT=X_FORMAT,
-                W_FORMAT=W_FORMAT,
-                UPCAST_INDICES=UPCAST_INDICES,
-                HAS_X_BLOCK_SCALE=HAS_X_BLOCK_SCALE,
-                HAS_W_BLOCK_SCALE=HAS_W_BLOCK_SCALE,
-                HAS_BIAS=HAS_BIAS,
-                HAS_GATHER=HAS_GATHER,
-                HAS_SCATTER=HAS_SCATTER,
-                DO_SWIGLU=DO_SWIGLU,
-                SWIGLU_ALPHA=SWIGLU_ALPHA,
-                SWIGLU_LIMIT=SWIGLU_LIMIT,
-                OUT_BLOCK_N=OUT_BLOCK_N,
-                APPLY_GATE_SCAL=APPLY_GATE_SCAL,
-                HAS_EXPERT_REMAP=TILE_HAS_EXPERT_REMAP,
-                HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
-                NUM_WARPS=NUM_WARPS,
-                NUM_BUFFERS=NUM_BUFFERS,
-                SCALE_LOAD_MODE=SCALE_LOAD_MODE,
-                W_TRANSPOSE=W_TRANSPOSE,
-                NUM_SUBTILES=NUM_SUBTILES,
-                EVEN_K=EVEN_K,
-                APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
-                USE_WARP_PIPELINE=USE_WARP_PIPELINE,
-                USE_SLICE_MNK=USE_SLICE_MNK,
-                USE_3STAGE_PIPELINE=USE_3STAGE_PIPELINE,
-            )
+    _pipelined_moe_tile_compute(
+        x_ptr,
+        w_ptr,
+        x_scale_ptr,
+        w_scale_ptr,
+        bias_ptr,
+        y_ptr,
+        gather_idx_ptr,
+        scatter_idx_ptr,
+        gate_scal_ptr,
+        expert_remap_ptr,
+        slice_offs_ptr,
+        slice_sizes_ptr,
+        stride_xm,
+        stride_xk,
+        stride_we,
+        stride_wn,
+        stride_wk,
+        stride_xsm,
+        stride_xsk,
+        stride_wse,
+        stride_wsn,
+        stride_wsk,
+        stride_yn,
+        stride_ym,
+        stride_be,
+        stride_bn,
+        M,
+        M_X,
+        N,
+        K,
+        x_global_scale_ptr,
+        compact_idx,
+        block_in_expert,
+        pid_n,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        BLOCKS_PER_EXPERT=BLOCKS_PER_EXPERT,
+        X_FORMAT=X_FORMAT,
+        W_FORMAT=W_FORMAT,
+        UPCAST_INDICES=UPCAST_INDICES,
+        HAS_X_BLOCK_SCALE=HAS_X_BLOCK_SCALE,
+        HAS_W_BLOCK_SCALE=HAS_W_BLOCK_SCALE,
+        HAS_BIAS=HAS_BIAS,
+        HAS_GATHER=HAS_GATHER,
+        HAS_SCATTER=HAS_SCATTER,
+        DO_SWIGLU=DO_SWIGLU,
+        SWIGLU_ALPHA=SWIGLU_ALPHA,
+        SWIGLU_LIMIT=SWIGLU_LIMIT,
+        OUT_BLOCK_N=OUT_BLOCK_N,
+        APPLY_GATE_SCAL=APPLY_GATE_SCAL,
+        HAS_EXPERT_REMAP=HAS_EXPERT_REMAP,
+        HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
+        NUM_WARPS=NUM_WARPS,
+        NUM_BUFFERS=NUM_BUFFERS,
+        SCALE_LOAD_MODE=SCALE_LOAD_MODE,
+        W_TRANSPOSE=W_TRANSPOSE,
+        NUM_SUBTILES=NUM_SUBTILES,
+        EVEN_K=EVEN_K,
+        APPLY_X_GLOBAL_SCALE=APPLY_X_GLOBAL_SCALE,
+        USE_WARP_PIPELINE=USE_WARP_PIPELINE,
+        USE_SLICE_MNK=USE_SLICE_MNK,
+        USE_3STAGE_PIPELINE=USE_3STAGE_PIPELINE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2496,6 +2447,29 @@ def static_profile(kernel: Any, *, label: str = "") -> dict:
     if label:
         profile["label"] = label
     return profile
+
+
+_LAST_KERNEL_PROFILE: dict | None = None
+_PROFILE_BY_KERNEL_ID: dict[int, dict] = {}
+
+
+def _capture_launch_profile(k: Any) -> None:
+    """Internal: snapshot the static GPR/occupancy profile of ``k``."""
+    global _LAST_KERNEL_PROFILE
+    key = id(k)
+    prof = _PROFILE_BY_KERNEL_ID.get(key)
+    if prof is None:
+        prof = static_profile(k)
+        _PROFILE_BY_KERNEL_ID[key] = prof
+    _LAST_KERNEL_PROFILE = prof
+
+
+def last_kernel_profile() -> dict | None:
+    """Return the static profile (sgpr/vgpr/scratch/occupancy) of the
+    most recent :func:`_launch_kernel` invocation, or ``None`` if no MoE
+    launch has happened yet on this process.
+    """
+    return _LAST_KERNEL_PROFILE
 
 
 def assert_no_spills(profile: dict, *, allow_scratch: int = 0) -> None:
@@ -3049,7 +3023,8 @@ def _launch_kernel(
             [float(a_global_scale)], dtype=torch.float32, device=x.device
         )
 
-    _pipelined_moe_kernel_scaled[grid](
+    # Common args / constexprs shared by both kernel entries.
+    common_args = (
         x,
         w3,
         x_scale_buf,
@@ -3062,8 +3037,8 @@ def _launch_kernel(
         expert_remap_buf,
         slice_offs_buf,
         slice_sizes_buf,
-        block_offs_buf,
-        block_schedule_buf,
+    )
+    common_strides = (
         x.stride(-2),
         x.stride(-1),
         w3.stride(0),
@@ -3078,12 +3053,9 @@ def _launch_kernel(
         y.stride(-2),
         bias.stride(0) if bias is not None else 0,
         bias.stride(-1) if bias is not None else 0,
-        M,
-        M_X,
-        N,
-        K,
-        x_global_scale_buf,
-        num_tiles_total,
+    )
+    common_dims = (M, M_X, N, K, x_global_scale_buf, num_tiles_total)
+    common_kwargs = dict(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -3113,14 +3085,43 @@ def _launch_kernel(
         USE_WARP_PIPELINE=use_warp_pipeline,
         USE_SLICE_MNK=use_slice_mnk,
         USE_3STAGE_PIPELINE=use_3stage_pipeline,
-        PERSISTENT=persistent,
-        USE_BLOCK_SCHEDULE=use_block_schedule,
-        N_EXPTS_TOT=n_slices,
         GRID_N=grid_n,
         GROUP_M=group_m,
         XCD_SWIZZLE=xcd_swizzle,
         num_warps=num_warps,
     )
+
+    if persistent or use_block_schedule:
+        # Persistent / block-schedule path lives in a sibling module so
+        # the non-persistent kernel stays straight-line. Both flavours
+        # share `_pipelined_moe_tile_compute` and the swizzle helpers.
+        from .gluon_persistent import _pipelined_moe_kernel_scaled_persistent
+
+        k = _pipelined_moe_kernel_scaled_persistent[grid](
+            *common_args,
+            block_offs_buf,
+            block_schedule_buf,
+            *common_strides,
+            *common_dims,
+            USE_BLOCK_SCHEDULE=use_block_schedule,
+            N_EXPTS_TOT=n_slices,
+            **common_kwargs,
+        )
+    else:
+        # Non-persistent: no block_offs / block_schedule / N_EXPTS_TOT /
+        # USE_BLOCK_SCHEDULE constexprs needed; the kernel is a single
+        # straight-line tile compute.
+        k = _pipelined_moe_kernel_scaled[grid](
+            *common_args,
+            *common_strides,
+            *common_dims,
+            **common_kwargs,
+        )
+
+    # Snapshot the just-launched kernel's static GPR / occupancy profile
+    # for bench-side ``last_kernel_profile()`` readers. id(k)-keyed cache
+    # keeps the regex cost out of the hot launch loop.
+    _capture_launch_profile(k)
 
 
 # ---------------------------------------------------------------------------

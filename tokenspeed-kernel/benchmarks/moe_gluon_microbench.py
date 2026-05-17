@@ -345,6 +345,8 @@ def dump_static_profiles():
     """Run each Gluon kernel once and dump its AMDGCN GPR profile."""
     from tokenspeed_kernel.ops.moe.gluon import (
         _pipelined_moe_kernel_scaled as _pipelined_moe_kernel,
+    )
+    from tokenspeed_kernel.ops.moe.gluon import (
         gluon_bf16_combine,
         gluon_bf16_dispatch_swiglu,
         gluon_bf16_gating_gemm,
@@ -397,6 +399,9 @@ def dump_static_profiles():
         gluon_mxfp_combine,
         gluon_mxfp_dispatch_swiglu,
         gluon_mxfp_gating_gemm,
+    )
+    from tokenspeed_kernel.ops.moe.gluon_persistent import (
+        _pipelined_moe_kernel_scaled_persistent,
     )
 
     for B in (32, 1024):
@@ -493,6 +498,7 @@ def dump_static_profiles():
             )
 
     _scan(_pipelined_moe_kernel, "unified")
+    _scan(_pipelined_moe_kernel_scaled_persistent, "persist ")
     if bad:
         raise SystemExit(f"{bad} kernel(s) reported spill -- aborting")
 
