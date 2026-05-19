@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.quantization import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from torch.nn.parameter import Parameter
@@ -40,14 +41,6 @@ _is_nvidia = current_platform().is_nvidia
 _is_blackwell = current_platform().is_blackwell
 _is_hopper = current_platform().is_hopper
 _is_amd = current_platform().is_amd
-
-
-def _quantize_to_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    fp8 = current_platform().fp8e4m3fn
-    inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
-    return (
-        (x.to(torch.float32) * inv_scale).clamp_(min=fp8.min, max=fp8.max).to(fp8.dtype)
-    )
 
 
 def swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -205,8 +198,15 @@ class Mxfp4TritonKernelBackend(MoEBackend):
             )
             layer.w13_act_scale = w13_in_scale
             layer.w2_act_scale = w2_in_scale
+            # Pre-compute ``1/scale`` as Python floats so the per-forward
+            # ``fp8_quantize`` call doesn't need a D2H sync. The tensor
+            # versions are still needed by ``InFlexData(scale=...)`` for
+            # downstream matmul dequantisation.
+            layer.w13_act_scale_inv = float((1.0 / w13_in_scale).item())
+            layer.w2_act_scale_inv = float((1.0 / w2_in_scale).item())
 
             fp8_dtype = current_platform().fp8e4m3fn.dtype
+            layer._fp8_dtype = fp8_dtype
             w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
             w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
             # Force bf16 output so the swiglu / down-proj results stay in a
@@ -285,7 +285,11 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         )
 
         if self._is_w4a8_fp8:
-            gemm1_input = _quantize_to_fp8(hidden_states, layer.w13_act_scale)
+            gemm1_input = fp8_quantize(
+                hidden_states,
+                scale_inv=layer.w13_act_scale_inv,
+                fp8_dtype=layer._fp8_dtype,
+            )
         else:
             gemm1_input = hidden_states
 
@@ -305,7 +309,11 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         )
 
         if self._is_w4a8_fp8:
-            gemm2_input = _quantize_to_fp8(intermediate_cache, layer.w2_act_scale)
+            gemm2_input = fp8_quantize(
+                intermediate_cache,
+                scale_inv=layer.w2_act_scale_inv,
+                fp8_dtype=layer._fp8_dtype,
+            )
         else:
             gemm2_input = intermediate_cache
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.quantization import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from torch.nn.parameter import Parameter
@@ -58,26 +59,6 @@ def _amd_fp8_dtype() -> torch.dtype:
     return torch.float8_e4m3fn
 
 
-def _quantize_to_fp8(
-    x: torch.Tensor, scale: torch.Tensor, fp8_dtype: torch.dtype
-) -> torch.Tensor:
-    """Quantize a row-major tensor ``x`` to FP8 with a per-tensor ``scale``.
-
-    ``scale`` is the *dequantization* scale; the produced FP8 values are the
-    direct input to ``triton_kernels.matmul`` together with
-    ``InFlexData(dtype=fp8, scale=scale)``. The math is performed in float32
-    so that the routine works regardless of whether ``x`` arrives in bf16 or
-    fp8 (some matmul outputs ride on the input dtype).
-    """
-    fp8_max = float(torch.finfo(fp8_dtype).max)
-    inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
-    return (
-        (x.to(torch.float32) * inv_scale)
-        .clamp_(min=-fp8_max, max=fp8_max)
-        .to(fp8_dtype)
-    )
-
-
 def _per_tensor_input_scale_loader(
     param: torch.nn.Parameter,
     loaded_weight: torch.Tensor,
@@ -101,9 +82,7 @@ def _per_tensor_input_scale_loader(
         raise ValueError(f"Unknown shard_id for input_scale: {shard_id!r}")
 
 
-def create_mxfp4_fp8_input_scales(
-    layer: nn.Module, num_local_experts: int
-) -> None:
+def create_mxfp4_fp8_input_scales(layer: nn.Module, num_local_experts: int) -> None:
     """Allocate per-expert ``w13_input_scale`` and ``w2_input_scale`` params."""
     w13 = nn.Parameter(
         torch.zeros(num_local_experts, dtype=torch.float32),
@@ -187,6 +166,12 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
         )
         layer.w13_act_scale = w13_in_scale
         layer.w2_act_scale = w2_in_scale
+        # Pre-compute ``1/scale`` as Python floats so the per-forward
+        # ``fp8_quantize`` call doesn't need a D2H sync. The tensor versions
+        # are still required for ``InFlexData(scale=...)`` consumed by the
+        # downstream matmul, so we keep them in addition.
+        layer.w13_act_scale_inv = float((1.0 / w13_in_scale).item())
+        layer.w2_act_scale_inv = float((1.0 / w2_in_scale).item())
         layer._fp8_dtype = fp8_dtype
 
         # Force bf16 output so the swiglu / down-proj results stay in a
@@ -270,8 +255,13 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
         )
 
         # Quantize hidden states with the per-tensor static FP8 scale baked
-        # into ``w13_precision_config.flex_ctx.lhs_data``.
-        x_fp8 = _quantize_to_fp8(hidden_states, layer.w13_act_scale, fp8_dtype)
+        # into ``w13_precision_config.flex_ctx.lhs_data``. ``scale_inv`` was
+        # precomputed during weight-loading to avoid any D2H sync here.
+        x_fp8 = fp8_quantize(
+            hidden_states,
+            scale_inv=layer.w13_act_scale_inv,
+            fp8_dtype=fp8_dtype,
+        )
 
         intermediate_cache = tokenspeed_kernel.moe_experts(
             x_fp8,
@@ -287,8 +277,10 @@ class Mxfp4Fp8TritonKernelBackend(Mxfp4TritonKernelBackend):
             expected_kernel_name="triton_kernels_dispatch_gemm",
         )
 
-        intermediate_fp8 = _quantize_to_fp8(
-            intermediate_cache, layer.w2_act_scale, fp8_dtype
+        intermediate_fp8 = fp8_quantize(
+            intermediate_cache,
+            scale_inv=layer.w2_act_scale_inv,
+            fp8_dtype=fp8_dtype,
         )
 
         return tokenspeed_kernel.moe_experts(
