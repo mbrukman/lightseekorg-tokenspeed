@@ -1,0 +1,696 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""MHA decode Gluon kernel optimized for AMD GFX950."""
+
+from __future__ import annotations
+
+import math
+from typing import NamedTuple
+
+import torch
+from tokenspeed_kernel._triton import gl, gluon, tl
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+
+cdna4 = gl.amd.cdna4
+async_copy = cdna4.async_copy
+
+_INV_LN2_VALUE = 1.4426950408889634
+_INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
+
+# ===-----------------------------------------------------------------------===#
+# Kernel Utilities
+# ===-----------------------------------------------------------------------===#
+
+
+@gluon.jit
+def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
+    return gl.maximum(a, b, propagate_nan=propagate_nan)
+
+
+@gluon.jit
+def max(input, axis=None, keep_dims=False):
+    return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
+
+
+# ===-----------------------------------------------------------------------===#
+# Kernel Config
+# ===-----------------------------------------------------------------------===#
+
+
+@gluon.aggregate
+class DecodeConfig:
+    SM_SCALE: gl.constexpr
+    PAGE_TABLE_STRIDE: gl.constexpr
+    PAGE_SIZE: gl.constexpr
+    MAX_KV_SPLITS: gl.constexpr
+    NUM_Q_HEADS: gl.constexpr
+    NUM_KV_HEADS: gl.constexpr
+    HEAD_DIM: gl.constexpr
+    BLOCK_M: gl.constexpr
+    BLOCK_N: gl.constexpr
+    IS_SLIDING: gl.constexpr
+    WINDOW_LEFT: gl.constexpr
+    GROUP_SIZE: gl.constexpr
+    qk_layout: gl.constexpr
+    pv_layout: gl.constexpr
+    q_layout: gl.constexpr
+    k_layout: gl.constexpr
+    p_layout: gl.constexpr
+    v_layout: gl.constexpr
+    load_layout: gl.constexpr
+    store_layout: gl.constexpr
+    reduce_layout: gl.constexpr
+    k_smem_layout: gl.constexpr
+    v_smem_layout: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        SM_SCALE,
+        PAGE_TABLE_STRIDE,
+        PAGE_SIZE,
+        MAX_KV_SPLITS,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_N,
+        IS_SLIDING,
+        WINDOW_LEFT,
+    ):
+        assert NUM_Q_HEADS == 64
+        assert NUM_KV_HEADS == 8
+        assert HEAD_DIM == 64
+        assert BLOCK_N == PAGE_SIZE
+        assert BLOCK_M >= NUM_Q_HEADS // NUM_KV_HEADS
+        if IS_SLIDING:
+            assert WINDOW_LEFT >= 0
+        else:
+            assert WINDOW_LEFT == -1
+
+        mfma_layout = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[1, 1],
+        )
+
+        self.SM_SCALE = gl.constexpr(SM_SCALE)
+        self.PAGE_TABLE_STRIDE = gl.constexpr(PAGE_TABLE_STRIDE)
+        self.PAGE_SIZE = gl.constexpr(PAGE_SIZE)
+        self.MAX_KV_SPLITS = gl.constexpr(MAX_KV_SPLITS)
+        self.NUM_Q_HEADS = gl.constexpr(NUM_Q_HEADS)
+        self.NUM_KV_HEADS = gl.constexpr(NUM_KV_HEADS)
+        self.HEAD_DIM = gl.constexpr(HEAD_DIM)
+        self.BLOCK_M = gl.constexpr(BLOCK_M)
+        self.BLOCK_N = gl.constexpr(BLOCK_N)
+        self.IS_SLIDING = gl.constexpr(IS_SLIDING)
+        self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
+        self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
+        self.qk_layout = gl.constexpr(mfma_layout)
+        self.pv_layout = gl.constexpr(mfma_layout)
+        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, mfma_layout, k_width=8))
+        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, mfma_layout, k_width=8))
+        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, mfma_layout, k_width=4))
+        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, mfma_layout, k_width=4))
+        self.load_layout = gl.constexpr(
+            gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
+        )
+        self.store_layout = gl.constexpr(
+            gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
+        )
+        self.reduce_layout = gl.constexpr(gl.BlockedLayout([1], [64], [1], [0]))
+        self.k_smem_layout = gl.constexpr(
+            gl.PaddedSharedLayout.with_identity_for(
+                [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
+            )
+        )
+        self.v_smem_layout = gl.constexpr(
+            gl.PaddedSharedLayout.with_identity_for(
+                [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
+            )
+        )
+
+
+# ===-----------------------------------------------------------------------===#
+# Kernel Program
+# ===-----------------------------------------------------------------------===#
+
+
+@gluon.aggregate
+class AttentionProgram:
+    cfg: gl.constexpr
+    q_ptr: gl.tensor
+    k_cache_ptr: gl.tensor
+    v_cache_ptr: gl.tensor
+    page_table_ptr: gl.tensor
+    cache_seqlens_ptr: gl.tensor
+    mid_o_ptr: gl.tensor
+    mid_lse_ptr: gl.tensor
+    batch: gl.tensor
+    kv_head: gl.tensor
+    split_id: gl.tensor
+    cache_len: gl.tensor
+    kv_start: gl.tensor
+    split_start: gl.tensor
+    split_end: gl.tensor
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        cfg,
+        q_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        page_table_ptr,
+        cache_seqlens_ptr,
+        mid_o_ptr,
+        mid_lse_ptr,
+        batch,
+        kv_head,
+        split_id,
+        cache_len,
+        kv_start,
+        split_start,
+        split_end,
+    ):
+        self.cfg = gl.constexpr(cfg)
+        self.q_ptr = q_ptr
+        self.k_cache_ptr = k_cache_ptr
+        self.v_cache_ptr = v_cache_ptr
+        self.page_table_ptr = page_table_ptr
+        self.cache_seqlens_ptr = cache_seqlens_ptr
+        self.mid_o_ptr = mid_o_ptr
+        self.mid_lse_ptr = mid_lse_ptr
+        self.batch = batch
+        self.kv_head = kv_head
+        self.split_id = split_id
+        self.cache_len = cache_len
+        self.kv_start = kv_start
+        self.split_start = split_start
+        self.split_end = split_end
+
+    @gluon.jit
+    def create(
+        cfg,
+        q_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        page_table_ptr,
+        cache_seqlens_ptr,
+        mid_o_ptr,
+        mid_lse_ptr,
+    ):
+        batch = gl.program_id(0)
+        kv_head = gl.program_id(1)
+        split_id = gl.program_id(2)
+        cache_len = gl.load(cache_seqlens_ptr + batch)
+        if cfg.IS_SLIDING:
+            window_len = min(cache_len, cfg.WINDOW_LEFT)
+            kv_start = cache_len - window_len
+        else:
+            kv_start = cache_len - cache_len
+        first_page = kv_start // cfg.PAGE_SIZE
+        end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
+        num_pages = end_page - first_page
+        pages_per_split = (num_pages + cfg.MAX_KV_SPLITS - 1) // cfg.MAX_KV_SPLITS
+        split_start_page = first_page + split_id * pages_per_split
+        split_end_page = min(split_start_page + pages_per_split, end_page)
+        split_start = split_start_page * cfg.PAGE_SIZE
+        split_end = min(split_end_page * cfg.PAGE_SIZE, cache_len)
+        return AttentionProgram(
+            gl.constexpr(cfg),
+            q_ptr,
+            k_cache_ptr,
+            v_cache_ptr,
+            page_table_ptr,
+            cache_seqlens_ptr,
+            mid_o_ptr,
+            mid_lse_ptr,
+            batch,
+            kv_head,
+            split_id,
+            cache_len,
+            kv_start,
+            split_start,
+            split_end,
+        )
+
+    @gluon.jit
+    def load_q(self):
+        cfg = self.cfg
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
+        q_heads = self.kv_head * cfg.GROUP_SIZE + offs_m
+        valid = offs_m < cfg.GROUP_SIZE
+        offsets = (
+            self.batch * cfg.NUM_Q_HEADS * cfg.HEAD_DIM
+            + q_heads[:, None] * cfg.HEAD_DIM
+            + offs_d[None, :]
+        )
+        return cdna4.buffer_load(self.q_ptr, offsets, mask=valid[:, None], other=0.0)
+
+    @gluon.jit
+    def init_state(self):
+        cfg = self.cfg
+        m_i = gl.full(
+            [cfg.BLOCK_M],
+            value=-float("inf"),
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.pv_layout),
+        )
+        l_i = gl.full(
+            [cfg.BLOCK_M],
+            value=0.0,
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.pv_layout),
+        )
+        acc = gl.zeros(
+            [cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout
+        )
+        return m_i, l_i, acc
+
+    @gluon.jit
+    def load_page(self, start_n):
+        cfg = self.cfg
+        page_index = start_n // cfg.PAGE_SIZE
+        return gl.load(
+            self.page_table_ptr + self.batch * cfg.PAGE_TABLE_STRIDE + page_index
+        )
+
+    @gluon.jit
+    def issue_buffer_load_k(self, physical_page, k_smem):
+        cfg = self.cfg
+        offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
+        token_loc = physical_page * cfg.PAGE_SIZE + offs_n
+        offsets = (
+            token_loc[:, None] * cfg.NUM_KV_HEADS * cfg.HEAD_DIM
+            + self.kv_head * cfg.HEAD_DIM
+            + offs_d[None, :]
+        )
+        async_copy.buffer_load_to_shared(k_smem, self.k_cache_ptr, offsets)
+        async_copy.commit_group()
+
+    @gluon.jit
+    def issue_buffer_load_v(self, physical_page, v_smem):
+        cfg = self.cfg
+        offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
+        token_loc = physical_page * cfg.PAGE_SIZE + offs_n
+        offsets = (
+            token_loc[:, None] * cfg.NUM_KV_HEADS * cfg.HEAD_DIM
+            + self.kv_head * cfg.HEAD_DIM
+            + offs_d[None, :]
+        )
+        async_copy.buffer_load_to_shared(v_smem, self.v_cache_ptr, offsets)
+        async_copy.commit_group()
+
+    @gluon.jit
+    def shared_load_k(self, k_smem):
+        return k_smem.permute([1, 0]).load(self.cfg.k_layout)
+
+    @gluon.jit
+    def shared_load_v(self, v_smem):
+        return v_smem.load(self.cfg.v_layout)
+
+    @gluon.jit
+    def compute_qk(self, q, k):
+        cfg = self.cfg
+        qk = gl.zeros(
+            [cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout
+        )
+        return cdna4.mfma(q, k, qk)
+
+    @gluon.jit
+    def apply_kv_mask(self, qk, start_n):
+        cfg = self.cfg
+        offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
+        tokens = start_n + offs_n[None, :]
+        mask = (tokens >= self.kv_start) & (tokens < self.split_end)
+        return gl.where(mask, qk, -float("inf"))
+
+    @gluon.jit
+    def softmax(self, qk, m_i, l_i, acc):
+        cfg = self.cfg
+        row_max = max(qk, axis=1)
+        row_max = gl.convert_layout(row_max, gl.SliceLayout(1, cfg.pv_layout))
+        m_new = maximum(m_i, row_max)
+        m_new_scaled = m_new * cfg.SM_SCALE
+        qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
+        p = gl.exp2(qk_shifted)
+        m_diff = m_i * cfg.SM_SCALE - m_new_scaled
+        alpha = gl.exp2(m_diff)
+        l_ij = gl.sum(p, axis=1)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
+        p = p.to(self.q_ptr.dtype.element_ty)
+        p = gl.convert_layout(p, cfg.p_layout)
+        return p, m_new, l_i, acc
+
+    @gluon.jit
+    def compute_pv(self, p, v, acc):
+        return cdna4.mfma(p, v, acc)
+
+    @gluon.jit
+    def store_split(self, acc, l_i, m_i):
+        cfg = self.cfg
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        q_heads = self.kv_head * cfg.GROUP_SIZE + offs_m
+        valid = (offs_m < cfg.GROUP_SIZE) & (self.split_start < self.split_end)
+        acc = gl.convert_layout(acc, cfg.store_layout)
+        l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
+        m_i = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.store_layout))
+        recip_l_i = 1.0 / l_i
+        part_o = acc * recip_l_i[:, None]
+        part_lse = m_i * cfg.SM_SCALE + gl.log2(l_i)
+        mid_o_offsets = (
+            (self.batch * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.MAX_KV_SPLITS
+            + self.split_id
+        ) * cfg.HEAD_DIM + offs_d[None, :]
+        mid_lse_offsets = (
+            self.batch * cfg.NUM_Q_HEADS + q_heads
+        ) * cfg.MAX_KV_SPLITS + self.split_id
+        cdna4.buffer_store(part_o, self.mid_o_ptr, mid_o_offsets, mask=valid[:, None])
+        cdna4.buffer_store(part_lse, self.mid_lse_ptr, mid_lse_offsets, mask=valid)
+
+
+# ===-----------------------------------------------------------------------===#
+# Kernel Program Entry
+# ===-----------------------------------------------------------------------===#
+
+
+@gluon.jit
+def attention_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    page_table_ptr,
+    cache_seqlens_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    SM_SCALE: gl.constexpr,
+    PAGE_TABLE_STRIDE: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    MAX_KV_SPLITS: gl.constexpr,
+    NUM_Q_HEADS: gl.constexpr,
+    NUM_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    IS_SLIDING: gl.constexpr,
+    WINDOW_LEFT: gl.constexpr,
+):
+    cfg = DecodeConfig(
+        SM_SCALE,
+        PAGE_TABLE_STRIDE,
+        PAGE_SIZE,
+        MAX_KV_SPLITS,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_N,
+        IS_SLIDING,
+        WINDOW_LEFT,
+    )
+    program = AttentionProgram.create(
+        cfg,
+        q_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        page_table_ptr,
+        cache_seqlens_ptr,
+        mid_o_ptr,
+        mid_lse_ptr,
+    )
+    k_smem = gl.allocate_shared_memory(
+        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+    )
+    v_smem = gl.allocate_shared_memory(
+        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+    )
+
+    q = program.load_q()
+    m_i, l_i, acc = program.init_state()
+
+    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
+        physical_page = program.load_page(start_n)
+        program.issue_buffer_load_k(physical_page, k_smem)
+        program.issue_buffer_load_v(physical_page, v_smem)
+        async_copy.wait_group(1)
+        k = program.shared_load_k(k_smem)
+        qk = program.compute_qk(q, k)
+        qk = program.apply_kv_mask(qk, start_n)
+        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+
+        async_copy.wait_group(0)
+        v = program.shared_load_v(v_smem)
+        acc = program.compute_pv(p, v, acc)
+
+    program.store_split(acc, l_i, m_i)
+
+
+@gluon.jit
+def reduce_kernel(
+    mid_o_ptr,
+    mid_lse_ptr,
+    out_ptr,
+    cache_seqlens_ptr,
+    sink_ptr,
+    MAX_KV_SPLITS: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    NUM_Q_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    HAS_SINK: gl.constexpr,
+    IS_SLIDING: gl.constexpr,
+    WINDOW_LEFT: gl.constexpr,
+):
+    cfg = DecodeConfig(
+        1.0,
+        1,
+        PAGE_SIZE,
+        MAX_KV_SPLITS,
+        NUM_Q_HEADS,
+        8,
+        HEAD_DIM,
+        16,
+        PAGE_SIZE,
+        IS_SLIDING,
+        WINDOW_LEFT,
+    )
+    batch = gl.program_id(0)
+    q_head = gl.program_id(1)
+    cache_len = gl.load(cache_seqlens_ptr + batch)
+    if cfg.IS_SLIDING:
+        window_len = min(cache_len, cfg.WINDOW_LEFT)
+        kv_start = cache_len - window_len
+    else:
+        kv_start = cache_len - cache_len
+    first_page = kv_start // cfg.PAGE_SIZE
+    end_page = (cache_len + cfg.PAGE_SIZE - 1) // cfg.PAGE_SIZE
+    num_pages = end_page - first_page
+    pages_per_split = (num_pages + cfg.MAX_KV_SPLITS - 1) // cfg.MAX_KV_SPLITS
+    offs_d = gl.arange(0, cfg.HEAD_DIM, layout=cfg.reduce_layout)
+    if HAS_SINK:
+        m_i = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
+        l_i = gl.full((), value=1.0, dtype=gl.float32)
+    else:
+        m_i = gl.full((), value=-float("inf"), dtype=gl.float32)
+        l_i = gl.full((), value=0.0, dtype=gl.float32)
+    acc = gl.full([cfg.HEAD_DIM], value=0.0, dtype=gl.float32, layout=cfg.reduce_layout)
+
+    for split_id in range(0, cfg.MAX_KV_SPLITS):
+        split_start_page = first_page + split_id * pages_per_split
+        split_end_page = min(split_start_page + pages_per_split, end_page)
+        split_start = split_start_page * cfg.PAGE_SIZE
+        split_end = min(split_end_page * cfg.PAGE_SIZE, cache_len)
+        if split_start < split_end:
+            mid_o_base = (
+                (batch * cfg.NUM_Q_HEADS + q_head) * cfg.MAX_KV_SPLITS + split_id
+            ) * cfg.HEAD_DIM
+            mid_lse_offset = (
+                batch * cfg.NUM_Q_HEADS + q_head
+            ) * cfg.MAX_KV_SPLITS + split_id
+            part_o = cdna4.buffer_load(mid_o_ptr, mid_o_base + offs_d)
+            part_lse = gl.load(mid_lse_ptr + mid_lse_offset)
+            m_new = maximum(m_i, part_lse)
+            alpha = gl.exp2(m_i - m_new)
+            beta = gl.exp2(part_lse - m_new)
+            acc = acc * alpha + part_o * beta
+            l_i = l_i * alpha + beta
+            m_i = m_new
+
+    out_base = (batch * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
+    cdna4.buffer_store(
+        (acc / l_i).to(out_ptr.dtype.element_ty), out_ptr, out_base + offs_d
+    )
+
+
+# ===-----------------------------------------------------------------------===#
+# Entry Point
+# ===-----------------------------------------------------------------------===#
+
+
+class LaunchConfig(NamedTuple):
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    page_size: int
+    max_kv_splits: int
+    block_m: int
+    block_n: int
+    sm_scale: float
+    is_sliding: bool
+    window_left: int
+
+
+def get_config(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    softmax_scale: float | None,
+    window_left: int,
+) -> LaunchConfig:
+    del page_table
+    head_dim = q.shape[2]
+    page_size = k_cache.shape[1]
+    block_m = 16
+    block_n = 64
+    is_sliding = window_left >= 0
+    window_left = window_left if is_sliding else -1
+    sm_scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+    return LaunchConfig(
+        num_q_heads=q.shape[1],
+        num_kv_heads=k_cache.shape[2],
+        head_dim=head_dim,
+        page_size=page_size,
+        max_kv_splits=8,
+        block_m=block_m,
+        block_n=block_n,
+        sm_scale=sm_scale * _INV_LN2_VALUE,
+        is_sliding=is_sliding,
+        window_left=window_left,
+    )
+
+
+@register_kernel(
+    "attention",
+    "mha_decode_with_kvcache",
+    name="gluon_mha_decode_fp16_gfx950",
+    solution="gluon",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    dtypes={torch.float16, torch.bfloat16},
+    priority=Priority.SPECIALIZED,
+    traits={
+        "query_len": frozenset({1}),
+        "num_q_heads": frozenset({64}),
+        "num_kv_heads": frozenset({8}),
+        "head_dim": frozenset({64}),
+        "page_size": frozenset({64}),
+        "sliding_window": frozenset({False, True}),
+        "support_sinks": frozenset({False, True}),
+        "support_logit_cap": frozenset({False}),
+        "return_lse": frozenset({False}),
+    },
+)
+def gluon_mha_decode_fp16_gfx950(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+) -> torch.Tensor:
+    del max_seqlen_k, logit_cap
+    assert not return_lse
+    has_sink = sinks is not None
+    sink_arg = sinks if sinks is not None else q
+    config = get_config(
+        q=q,
+        k_cache=k_cache,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        window_left=window_left,
+    )
+
+    batch = q.shape[0]
+    output = torch.empty_like(q)
+    mid_o = torch.empty(
+        (batch, config.num_q_heads, config.max_kv_splits, config.head_dim),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    mid_lse = torch.empty(
+        (batch, config.num_q_heads, config.max_kv_splits),
+        device=q.device,
+        dtype=torch.float32,
+    )
+
+    attention_kernel[(batch, config.num_kv_heads, config.max_kv_splits)](
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        mid_o,
+        mid_lse,
+        config.sm_scale,
+        page_table.stride(0),
+        config.page_size,
+        config.max_kv_splits,
+        config.num_q_heads,
+        config.num_kv_heads,
+        config.head_dim,
+        config.block_m,
+        config.block_n,
+        config.is_sliding,
+        config.window_left,
+        num_warps=1,
+    )
+    reduce_kernel[(batch, config.num_q_heads)](
+        mid_o,
+        mid_lse,
+        output,
+        cache_seqlens,
+        sink_arg,
+        config.max_kv_splits,
+        config.page_size,
+        config.num_q_heads,
+        config.head_dim,
+        has_sink,
+        config.is_sliding,
+        config.window_left,
+        num_warps=1,
+    )
+    return output
