@@ -750,15 +750,15 @@ class TestDecodeInputIds:
         if op.num_extends() > 0:
             # Reprefill path: last token sits in the input_ids vector.
             assert op.input_ids, "Expected input_ids on the reprefill op"
-            assert op.input_ids[-1] == last_token, (
-                f"Expected {last_token}, got {op.input_ids[-1]}"
-            )
+            assert (
+                op.input_ids[-1] == last_token
+            ), f"Expected {last_token}, got {op.input_ids[-1]}"
         else:
             # Decode-from-retracted path: last token sits in decode_input_ids.
             assert op.decode_input_ids, "Expected decode_input_ids on the decode op"
-            assert op.decode_input_ids[0] == last_token, (
-                f"Expected {last_token}, got {op.decode_input_ids[0]}"
-            )
+            assert (
+                op.decode_input_ids[0] == last_token
+            ), f"Expected {last_token}, got {op.decode_input_ids[0]}"
 
     def test_mixed_batch_decode_input_ids_length(self):
         """decode_input_ids has one entry per decode request; all -1 for normal decodes."""
