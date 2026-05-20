@@ -542,9 +542,10 @@ def reduce_kernel(
             m_i = m_new
 
     out_base = (batch * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
-    cdna4.buffer_store(
-        (acc / l_i).to(out_ptr.dtype.element_ty), out_ptr, out_base + offs_d
-    )
+    l_i_recip = 1.0 / l_i
+    output = acc * l_i_recip
+    output = output.to(out_ptr.dtype.element_ty)
+    cdna4.buffer_store(output, out_ptr, out_base + offs_d)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -573,7 +574,6 @@ def get_config(
     softmax_scale: float | None,
     window_left: int,
 ) -> LaunchConfig:
-    del page_table
     head_dim = q.shape[2]
     page_size = k_cache.shape[1]
     block_m = 16
@@ -632,7 +632,6 @@ def gluon_mha_decode_fp16_gfx950(
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor:
-    del max_seqlen_k, logit_cap
     assert not return_lse
     has_sink = sinks is not None
     sink_arg = sinks if sinks is not None else q
