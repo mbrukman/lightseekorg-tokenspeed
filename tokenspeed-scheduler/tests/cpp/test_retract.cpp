@@ -410,7 +410,10 @@ TEST_F(RetractTailPageTestSuite, Retract_TailPageZero_PreservesBoundaryPage) {
 
     bool found_r1 = false;
     for (const auto& id : fwd->request_ids) {
-        if (id == "r1") { found_r1 = true; break; }
+        if (id == "r1") {
+            found_r1 = true;
+            break;
+        }
     }
     ASSERT_TRUE(found_r1);
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);

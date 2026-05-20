@@ -150,7 +150,10 @@ TEST_F(RetractLeakTestSuite, RecoveryAfterTailPageRelease) {
     ASSERT_NE(fwd, nullptr);
     bool found = false;
     for (const auto& id : fwd->request_ids) {
-        if (id == "r1") { found = true; break; }
+        if (id == "r1") {
+            found = true;
+            break;
+        }
     }
     ASSERT_TRUE(found);
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);

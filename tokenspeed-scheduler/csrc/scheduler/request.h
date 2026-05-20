@@ -172,15 +172,16 @@ public:
     // pinned ``host_node_ref_`` — no radix-tree walk. Throws if the state
     // isn't Retracted (caller is expected to gate via ``Is<Retracted>()``).
     std::int32_t RetractedPartialTailTokens() const {
-        return std::visit(Overloaded{
-            [this](const fsm::Retracted& s) -> std::int32_t {
-                const std::int32_t host_cached_tokens = s.HostMatchedPages() * s.GetPageSize();
-                return std::max(0, token_container_.Size() - host_cached_tokens);
-            },
-            [this](const auto&) -> std::int32_t {
-                throw std::logic_error("Request::RetractedPartialTailTokens: expected state=Retracted; got state=" +
-                                       StateName());
-            },
+        return std::visit(
+            Overloaded{
+                [this](const fsm::Retracted& s) -> std::int32_t {
+                    const std::int32_t host_cached_tokens = s.HostMatchedPages() * s.GetPageSize();
+                    return std::max(0, token_container_.Size() - host_cached_tokens);
+                },
+                [this](const auto&) -> std::int32_t {
+                    throw std::logic_error("Request::RetractedPartialTailTokens: expected state=Retracted; got state=" +
+                                           StateName());
+                },
             },
             state_);
     }
