@@ -625,6 +625,10 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         return std::any_of(ops.begin(), ops.end(),
                            [](const ForwardOperation& op) { return std::holds_alternative<PrefillOperation>(op); });
     };
+    auto has_decode_op = [&]() {
+        return std::any_of(ops.begin(), ops.end(),
+                           [](const ForwardOperation& op) { return std::holds_alternative<DecodeOperation>(op); });
+    };
     std::vector<LoadBackOperation> loadback_ops;
     auto simulated_free = initialPagedCacheGroupSimulatedFree();
     for (Request* request : candidates) {
@@ -664,6 +668,15 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             // re-prefill (PrefillOperation carries input_ids). == 0 →
             // straight loadback + decode (DecodeOperation).
             if (request->RetractedPartialTailTokens() > 0) {
+                // The reprefill emits a PrefillOperation. In !mixed mode
+                // the executor's mix-batch fast path (input_buffer.py:239)
+                // reads ``future_input_map[..., :1]`` per decode request —
+                // discarding spec draft tokens past column 0. Mixing this
+                // PrefillOp into a batch that already has Decode ops
+                // (spec-verify shape: decode_input_tokens > 1) yields a
+                // size mismatch at decode-id fill time. Defer to a later
+                // plan when no Decode ops are queued yet.
+                if (!config_.enable_mixed_prefill_decode && has_decode_op()) break;
                 if (auto ev = scheduleRetractedReprefill(request, simulated_free)) {
                     std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                     push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);

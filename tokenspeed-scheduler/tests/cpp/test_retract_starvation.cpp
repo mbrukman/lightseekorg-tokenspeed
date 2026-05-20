@@ -199,4 +199,49 @@ TEST_F(RetractLeakTestSuite, RecoveryShiftedInputIdsCoversGeneratedTail) {
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
+// In !enable_mixed_prefill_decode mode, a Retracted-recovery reprefill
+// (PrefillOperation) must not share a batch with active Decode ops. The
+// executor's mix-batch fast path reads only the first slot of
+// future_input_map per decode request and would mismatch sizes when
+// spec decoding stuffs decode_input_tokens > 1 into the decode portion.
+// Defer the reprefill to a later plan; the existing Decode ops run alone
+// this round.
+TEST_F(RetractLeakTestSuite, ReprefillDoesNotMixWithDecodeOpsInStrictMode) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/1, /*start=*/1));
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    SendReserveNumTokens("r1", 5);
+
+    auto plan1 = PlanOnce();
+    const auto* wb = GetWriteBack(plan1);
+    ASSERT_NE(wb, nullptr);
+    SendWriteBackDone(wb->op_ids[0]);
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+
+    // Submit a second request and bring it to Decoding while r1 sits in
+    // Retracted. Now the next plan has two candidates: r2 (Decoding) and
+    // r1 (Retracted with partial_tail > 0).
+    Submit(MakeRequestSpec("r2", /*num_pages=*/1, /*start=*/10'000));
+    PlanOnce();  // r2 prefill
+    SendForwardDone("r2", {77});
+    PlanOnce();  // r2 → Decoding
+    ASSERT_EQ(scheduler_->DecodingSize(), 1u);
+
+    // Now planning: r2 (Decoding) goes first, pushes a DecodeOp; r1
+    // (Retracted, partial_tail > 0) wants to push a PrefillOp. The dispatch
+    // must NOT mix them under !enable_mixed_prefill_decode.
+    auto plan_mix = PlanOnce();
+    const auto* fwd = GetForward(plan_mix);
+    ASSERT_NE(fwd, nullptr);
+    // Either r2 is alone (reprefill deferred) OR r1 alone — but never both
+    // in the same forward op. Specifically: no batch should contain both
+    // num_extends > 0 AND any DecodeOp.
+    if (fwd->num_extends() > 0) {
+        EXPECT_EQ(fwd->num_extends(), fwd->request_ids.size())
+            << "Mixed reprefill PrefillOp + DecodeOp would break the executor's "
+            << "input_buffer mix-batch path under spec decoding.";
+    }
+}
+
 }  // namespace tokenspeed::test
