@@ -649,7 +649,7 @@ def process_single_attention_tile(
 
     k_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(1, cfg.k_layout))
     k_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.k_layout))
-    k_offsets = cfg.k_input_layout.offsets(
+    k_offsets = cfg.k_strides.offsets(
         program.seq_base + k_offs_n[None, :], program.kv_head, k_offs_d[:, None]
     )
     k_mask = k_offs_n[None, :] < program.seq_len
@@ -657,7 +657,7 @@ def process_single_attention_tile(
 
     v_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout))
     v_offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.v_layout))
-    v_offsets = cfg.v_input_layout.offsets(
+    v_offsets = cfg.v_strides.offsets(
         program.seq_base + v_offs_n[:, None], program.kv_head, v_offs_d[None, :]
     )
     v_mask = v_offs_n[:, None] < program.seq_len
