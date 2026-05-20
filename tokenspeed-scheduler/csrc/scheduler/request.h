@@ -142,10 +142,15 @@ public:
                 requires(std::derived_from<T, fsm::ForwardState> || std::derived_from<T, fsm::Submitted> ||
                          std::same_as<T, fsm::Aborting> || std::same_as<T, fsm::PrefetchDone>)
             { return s.GetOccupiedPages(); },
+            // Retracted holds no device pages (tail page released at retract).
+            // ``applyPrefillEvent`` queries this on the pre-Apply state to
+            // compute the ``begin`` offset for the post-Apply page list;
+            // Retracted's "pre" page count is 0, matching Submitted.
+            [](const fsm::Retracted&) -> std::vector<std::int32_t> { return {}; },
             [this](const auto&) -> std::vector<std::int32_t> {
                 throw std::logic_error(
-                    "Request::GetOccupiedPages: expected state=Submitted, PrefetchDone, Aborting, or forward; got "
-                    "state=" +
+                    "Request::GetOccupiedPages: expected state=Submitted, PrefetchDone, Retracted, Aborting, or "
+                    "forward; got state=" +
                     StateName());
             },
             },

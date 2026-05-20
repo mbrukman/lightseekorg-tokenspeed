@@ -129,7 +129,12 @@ TEST_F(RetractTestSuite, Retract_WriteBackDoneTransitionsToRetracted) {
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
 }
 
-// Retracted request recovers to Decoding on next PlanOnce.
+// Retracted request recovers to Decoding via a partial-tail re-prefill step
+// followed by a normal decode step. With the tail-page-release fix (see
+// WriteBackDoneEvent::operator()(Retracting&&) in fsm/forward_events.cpp),
+// Retracted holds no device tail page so recovery re-prefills the partial
+// tail via a PrefillOperation, then transitions PrefillDone → Decoding on
+// the subsequent plan.
 TEST_F(RetractTestSuite, Retract_RetractedRequestRecoversToDecoding) {
     BringToDecoding("r1");
     SendReserveNumTokens("r1", 3);
@@ -142,6 +147,8 @@ TEST_F(RetractTestSuite, Retract_RetractedRequestRecoversToDecoding) {
     SendWriteBackDone(wb->op_ids[0]);
     ASSERT_EQ(scheduler_->RetractedSize(), 1u);
 
+    // plan2: re-prefill the partial tail → request leaves Retracted and lands
+    // in PrefillDone; the forward op is a PrefillOperation, not Decode.
     auto plan2 = PlanOnce();
     const FlatForwardOperation* fwd = nullptr;
     for (const auto& op : plan2.Operations()) {
@@ -159,8 +166,13 @@ TEST_F(RetractTestSuite, Retract_RetractedRequestRecoversToDecoding) {
         }
     }
     EXPECT_TRUE(in_fwd);
-    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+
+    // Simulate the executor sampling a token from the re-prefill's last
+    // position, then plan3 transitions PrefillDone → Decoding.
+    SendForwardDone("r1", {77});
+    PlanOnce();
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
 // ============================================================
@@ -395,10 +407,12 @@ TEST_F(RetractTailPageTestSuite, Retract_TailPageZero_PreservesBoundaryPage) {
     SendWriteBackDone(wb->op_ids[0]);
     EXPECT_EQ(scheduler_->RetractedSize(), 1u);
 
-    // Recovery: Retracted → Decoding.
+    // Recovery (post tail-page-release fix): Retracted → PrefillDone via a
+    // partial-tail re-prefill (PrefillOperation), then PrefillDone → Decoding
+    // on the next plan.
     auto plan2 = PlanOnce();
     const auto* fwd = GetForward(plan2);
-    ASSERT_NE(fwd, nullptr) << "Recovery should produce a forward op";
+    ASSERT_NE(fwd, nullptr) << "Recovery should produce a forward op (re-prefill)";
 
     bool found_r1 = false;
     std::int32_t r1_idx = -1;
@@ -410,13 +424,16 @@ TEST_F(RetractTailPageTestSuite, Retract_TailPageZero_PreservesBoundaryPage) {
         }
     }
     ASSERT_TRUE(found_r1) << "r1 must be in the forward batch after recovery";
-    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
 
-    // Verify boundary page preserved: occupied_pages has loadback + boundary + decode pages.
-    // With fix: 1 loadback page + 2 boundary/reserve pages + 1 decode page = 4 pages minimum.
-    // Without fix: boundary page lost, model reads garbage at position 2.
-    EXPECT_GE(static_cast<std::int32_t>(fwd->occupied_pages[r1_idx].size()), 3);
+    // Drive the second plan: prefill's last-position sampling delivers a
+    // new token, then PrefillDone → Decoding.
+    SendForwardDone("r1", {99});
+    PlanOnce();
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+
+    // Recovery's re-prefill allocated at least the partial-tail page(s).
+    EXPECT_GE(static_cast<std::int32_t>(fwd->occupied_pages[r1_idx].size()), 1);
 }
 
 }  // namespace tokenspeed::test

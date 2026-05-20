@@ -103,6 +103,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_write_back.cpp
         tests/cpp/test_load_back.cpp
         tests/cpp/test_retract.cpp
+        tests/cpp/test_retract_starvation.cpp
         tests/cpp/test_prefix_cache_host_match.cpp
         tests/cpp/test_abort.cpp
         tests/cpp/test_basic_lifecycle.cpp

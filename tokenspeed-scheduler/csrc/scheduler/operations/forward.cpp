@@ -201,7 +201,15 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
 
     const std::int32_t device_matched2 = match_result.device.DepthInPage();
     const std::int32_t host_matched2 = match_result.host.DepthInPage();
-    // Pages needed: LoadBack nodes (host→device) + pages for decode step itself.
+    // Precondition: caller only invokes scheduleDecodeFromRetracted when
+    // partial_tail_tokens == 0. The dispatch in newForwardOperation routes
+    // requests with a non-zero partial tail through
+    // scheduleRetractedReprefill instead, which emits a PrefillOperation
+    // capable of carrying the partial-tail token IDs (DecodeOperation only
+    // stores a single decode_input_id and cannot represent multi-token
+    // re-prefill — see PrefillOperation vs DecodeOperation in forward.h).
+    //
+    // Pages needed: LoadBack nodes (host→device) + the decode step itself.
     std::int32_t num_tokens = 0;
     if (host_matched2 > device_matched2) {
         num_tokens += (config_.page_size * (host_matched2 - device_matched2)) + config_.decode_input_tokens;
@@ -263,6 +271,109 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
 
     return fsm::ScheduleDecodeFromRetractedEvent{
         config_.decode_input_tokens,
+        &device_allocator_,
+        &req_pool_allocator_,
+        &kv_prefix_cache_,
+        std::move(match_result),
+        loadback_diff,
+        mamba_allocator_ ? &*mamba_allocator_ : nullptr,
+    };
+}
+
+// Retracted recovery for the case where partial_tail > 0: emit a
+// PrefillOperation that re-prefills the dropped-KV partial-tail tokens, then
+// the next plan picks up the PrefillDone state and schedules a normal decode.
+//
+// We can't reuse scheduleDecodeFromRetracted because DecodeOperation only
+// carries a single decode_input_id; multi-token re-prefill needs the
+// input_ids vector that lives on PrefillOperation.
+std::optional<fsm::ScheduleRetractedReprefillEvent> Scheduler::scheduleRetractedReprefill(
+    Request* request, std::map<std::string, std::int32_t>& simulated_free) {
+    if (req_pool_allocator_.AvailableSlots() == 0) return {};
+
+    MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery);
+    std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
+    TreeNode* mamba_recovery_node = nullptr;
+    if (hybrid_prefix_cache_ && mamba_allocator_) {
+        mamba_recovery_node = hybrid_prefix_cache_->FindLastMambaNode(match_result.host.last_node);
+        if (mamba_recovery_node == nullptr) {
+            spdlog::warn("[Scheduler] Retracted request {} lost tree-owned Mamba state, aborting request",
+                         request->Id());
+            request->Apply(fsm::AbortEvent{});
+            return {};
+        }
+        match_result.mamba_cow_src_index = mamba_recovery_node->MambaSlotIndex();
+    }
+
+    const std::int32_t device_matched = match_result.device.DepthInPage();
+    const std::int32_t host_matched = match_result.host.DepthInPage();
+    const std::int32_t window_begin = host_matched * config_.page_size;
+    const std::int32_t partial_tail_tokens = std::max(0, request->TokenSize() - window_begin);
+    if (partial_tail_tokens == 0) {
+        // Caller should have routed to scheduleDecodeFromRetracted instead.
+        return {};
+    }
+
+    // Pages needed: loadback (host→device) + partial-tail re-prefill +
+    // decode reserve for the immediately-following Decoding step.
+    std::int32_t num_tokens = 0;
+    if (host_matched > device_matched) {
+        num_tokens += config_.page_size * (host_matched - device_matched);
+    }
+    num_tokens += partial_tail_tokens + config_.decode_input_tokens;
+    const std::int32_t device_pages_needed = (num_tokens + config_.page_size - 1) / config_.page_size;
+
+    std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
+    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(device_pages_needed)) {
+        return {};
+    }
+    if (hybrid_prefix_cache_ && mamba_allocator_) {
+        if (!hybrid_prefix_cache_->EnsureMambaCapacityByEvict(2, mamba_recovery_node)) {
+            return {};
+        }
+    }
+
+    std::map<std::string, std::int32_t> released_back;
+    auto req_it = request_paged_cache_tables_.find(request->Id());
+    if (req_it != request_paged_cache_tables_.end()) {
+        for (const auto& [gid, table] : req_it->second) {
+            released_back[gid] = table.ActivePagesCount();
+        }
+    }
+    auto simulated_after_release = simulated_free;
+    for (const auto& [gid, n] : released_back) {
+        simulated_after_release[gid] += n;
+    }
+
+    PagedCacheGroupAdmission admission;
+    const std::int32_t target = request->TokenSize();
+    if (!paged_cache_allocators_.empty() && target >= 0) {
+        for (const auto& [gid, allocator] : paged_cache_allocators_) {
+            const auto& cfg = allocator->Config();
+            if (cfg.entry_stride_tokens <= 0 || cfg.rows_per_page <= 0) continue;
+            const std::int32_t entries = CeilDivPositive(target, cfg.entry_stride_tokens);
+            const std::int32_t required = (entries + cfg.rows_per_page - 1) / cfg.rows_per_page;
+            const std::int32_t free =
+                simulated_after_release.count(gid) ? simulated_after_release.at(gid) : allocator->AvailablePages();
+            admission.releasable_pages[gid] = 0;
+            admission.new_pages_needed[gid] = required;
+            if (free < required) {
+                admission.ok = false;
+            }
+        }
+    }
+    if (!admission.ok) {
+        return {};
+    }
+    for (const auto& [gid, n] : released_back) {
+        simulated_free[gid] += n;
+    }
+    applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
+
+    return fsm::ScheduleRetractedReprefillEvent{
+        partial_tail_tokens,
+        config_.decode_input_tokens,
+        window_begin,
         &device_allocator_,
         &req_pool_allocator_,
         &kv_prefix_cache_,
@@ -360,7 +471,9 @@ std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retrac
 
 // Apply event: state transfer + resource allocation
 template <typename Event>
-    requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
+    requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> ||
+             std::same_as<Event, fsm::SchedulePrefillEvent> ||
+             std::same_as<Event, fsm::ScheduleRetractedReprefillEvent>)
 static PrefillOperation applyPrefillEvent(Request* request, Event event) {
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
     request->Apply(event);
@@ -404,6 +517,19 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
 
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event) {
     auto op = applyPrefillEvent(request, std::move(event));
+    acquirePagedCachePagesForRequest(op.request_id, op.extend_prefix_len, op.extend_prefix_len + op.input_length);
+    populatePagedCachePagesForOp(op);
+    return op;
+}
+
+// Retracted → PrefillDone via the partial-tail re-prefill path.
+// Produces a normal PrefillOperation; executor handles it like any
+// prefill chunk that hit the host cache (existing code path).
+PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleRetractedReprefillEvent event) {
+    auto match = event.GetMatchResult();
+    auto op = applyPrefillEvent(request, std::move(event));
+    op.mamba_cow_src_idx = match.mamba_cow_src_index;
+    op.mamba_branching_seqlen = match.mamba_branching_seqlen;
     acquirePagedCachePagesForRequest(op.request_id, op.extend_prefix_len, op.extend_prefix_len + op.input_length);
     populatePagedCachePagesForOp(op);
     return op;
@@ -547,7 +673,26 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
             if (!config_.enable_mixed_prefill_decode && has_prefill_op()) break;
 
-            if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
+            // Recovery splits two ways based on whether the request's tokens
+            // align with the host-cached page boundary. If a partial tail
+            // exists, those tokens had their KV dropped at retract (no device
+            // tail page is kept) and must be re-prefilled — we emit a
+            // PrefillOperation. Otherwise plain loadback + decode is enough.
+            const std::int32_t host_matched_pages =
+                kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery)
+                    .host.DepthInPage();
+            const std::int32_t partial_tail =
+                std::max(0, request->TokenSize() - host_matched_pages * config_.page_size);
+            if (partial_tail > 0) {
+                if (auto ev = scheduleRetractedReprefill(request, simulated_free)) {
+                    std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
+                    push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);
+                    if (!loadback_diff.empty()) {
+                        cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
+                        loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, op_id));
+                    }
+                }
+            } else if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)));
                 if (!loadback_diff.empty()) {

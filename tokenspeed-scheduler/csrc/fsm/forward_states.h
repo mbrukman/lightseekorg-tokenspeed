@@ -39,10 +39,26 @@
 
 namespace tokenspeed::fsm {
 
+// Compute the per-position "next token" for the chunk in ``window``, used by
+// the drafter (e.g. EAGLE) to feed its first-step input during a prefill
+// forward. shifted[i] is the token at position (window.begin + i + 1) in the
+// token container, or -1 if no such token is yet present.
+//
+// We cap at ``Size()`` (the total token count, prompt + already-generated)
+// rather than ``PrefillSize()`` (prompt only) so the cap correctly covers
+// both:
+//   1. Submitted → Prefilling/PrefillDone: container has only the prompt,
+//      so Size() == PrefillSize() — no change in behavior.
+//   2. Retracted → PrefillDone (partial-tail re-prefill, see
+//      ScheduleRetractedReprefillEvent in forward_events.h): container has
+//      prompt + generated tokens, and the re-prefill window lives in
+//      [PrefillSize(), Size()). Capping at PrefillSize() would mask those
+//      tokens as -1, leaving the drafter with garbage at non-boundary
+//      positions and tanking spec acceptance for one iter post-recovery.
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
                                                         TokenContainer::Window window) {
     const std::int32_t shifted_start = window.begin + 1;
-    const std::int32_t shifted_end = std::min(token_container->PrefillSize(), shifted_start + window.size);
+    const std::int32_t shifted_end = std::min(token_container->Size(), shifted_start + window.size);
     const std::int32_t shifted_size = std::max<std::int32_t>(0, shifted_end - shifted_start);
 
     std::vector<std::int32_t> shifted;
@@ -361,28 +377,30 @@ private:
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator_{};
 };
 
+// Retracted holds NO device pages. The tail page that used to live in
+// local_kv_allocator_ is released back to the pool at the Retracting →
+// Retracted transition; on recovery, ScheduleDecodeFromRetractedEvent
+// allocates a fresh LocalKVAllocator and re-prefills the partial-tail tokens
+// (those past the last full-page boundary that were never written to host).
+// host_node_ref_ is retained so the host-cached prefix stays pinned and the
+// recovery loadback hits cache instead of a full re-prefill from scratch.
 struct Retracted {
     Retracted(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
-              std::unique_ptr<LocalKVAllocator> local_kv_allocator,
               std::unique_ptr<LocalMambaAllocator> local_mamba_allocator = nullptr)
         : token_container_{token_container},
           page_size_{page_size},
           host_node_ref_{std::move(host_node_ref)},
-          local_kv_allocator_(std::move(local_kv_allocator)),
           local_mamba_allocator_(std::move(local_mamba_allocator)) {}
 
     TokenContainer* GetTokenContainer() { return token_container_; }
     std::int32_t GetPageSize() const { return page_size_; }
-    std::int32_t TailPageAvailableTokens() const {
-        return local_kv_allocator_ ? local_kv_allocator_->TailPageAvailableTokens() : 0;
-    }
-    std::unique_ptr<LocalKVAllocator> TakeKVAllocator() && { return std::move(local_kv_allocator_); }
+
+    // No device pages held; tail page was released to the pool at retract time.
+    std::int32_t TailPageAvailableTokens() const { return 0; }
     std::unique_ptr<LocalMambaAllocator> TakeMambaAllocator() && { return std::move(local_mamba_allocator_); }
 
-    // Returns only the pages held by the local KV allocator (tail page kept after retraction).
-    std::vector<std::int32_t> GetLocalAllocatorPages() const {
-        return local_kv_allocator_ ? local_kv_allocator_->Pages() : std::vector<std::int32_t>{};
-    }
+    // Retracted holds no device pages.
+    std::vector<std::int32_t> GetLocalAllocatorPages() const { return {}; }
 
     void ExtendResultTokens(const std::vector<std::int32_t> result_tokens) { token_container_->Extend(result_tokens); }
 
@@ -390,7 +408,6 @@ private:
     TokenContainer* token_container_{};
     std::int32_t page_size_{};
     std::unique_ptr<HostNodeRef> host_node_ref_{};
-    std::unique_ptr<LocalKVAllocator> local_kv_allocator_{};
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator_{};
 };
 

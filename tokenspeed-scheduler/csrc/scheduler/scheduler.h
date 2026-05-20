@@ -97,6 +97,7 @@ private:
     PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event);
     DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeEvent event);
     DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeFromRetractedEvent event);
+    PrefillOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleRetractedReprefillEvent event);
     std::optional<WriteBackOperation> applyEventAndGenerateOp(Request* request, fsm::ScheduleRetractEvent event);
     PrefetchOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefetchEvent event);
 
@@ -111,6 +112,8 @@ private:
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request,
                                                            std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(
+        Request* request, std::map<std::string, std::int32_t>& simulated_free);
+    std::optional<fsm::ScheduleRetractedReprefillEvent> scheduleRetractedReprefill(
         Request* request, std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
