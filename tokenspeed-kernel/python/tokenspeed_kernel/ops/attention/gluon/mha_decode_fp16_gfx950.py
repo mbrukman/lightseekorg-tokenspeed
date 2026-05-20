@@ -329,7 +329,7 @@ class AttentionProgram:
             + self.kv_head * cfg.HEAD_DIM
             + offs_d[None, :]
         )
-        async_copy.buffer_load_to_shared(k_smem, self.k_cache_ptr, offsets)
+        async_copy.global_load_to_shared(k_smem, self.k_cache_ptr + offsets)
         async_copy.commit_group()
 
     @gluon.jit
@@ -343,7 +343,7 @@ class AttentionProgram:
             + self.kv_head * cfg.HEAD_DIM
             + offs_d[None, :]
         )
-        async_copy.buffer_load_to_shared(v_smem, self.v_cache_ptr, offsets)
+        async_copy.global_load_to_shared(v_smem, self.v_cache_ptr + offsets)
         async_copy.commit_group()
 
     @gluon.jit
@@ -673,6 +673,7 @@ def gluon_mha_decode_fp16_gfx950(
 
     batch = q.shape[0]
     output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+
     mid_o = torch.empty(
         (batch, config.num_q_heads, config.num_kv_splits, config.head_dim),
         device=q.device,
