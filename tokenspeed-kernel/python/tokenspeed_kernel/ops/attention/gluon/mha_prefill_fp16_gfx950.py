@@ -823,8 +823,13 @@ def process_attention_tile(
     program.store_output(output)
 
 
+# ===-----------------------------------------------------------------------===#
+# Entry Point
+# ===-----------------------------------------------------------------------===#
+
+
 @gluon.jit
-def attention_kernel(
+def _mha_prefill_fp16(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -932,11 +937,6 @@ def attention_kernel(
             q_round += 1
 
 
-# ===-----------------------------------------------------------------------===#
-# Entry Point
-# ===-----------------------------------------------------------------------===#
-
-
 class LaunchConfig(NamedTuple):
     n_heads: int
     n_kv_heads: int
@@ -1038,7 +1038,7 @@ def gluon_mha_prefill_fp16_gfx950(
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
 
-    attention_kernel[config.grid](
+    _mha_prefill_fp16[config.grid](
         q,
         k,
         v,

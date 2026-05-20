@@ -396,12 +396,12 @@ class AttentionProgram:
 
 
 # ===-----------------------------------------------------------------------===#
-# Kernel Program Entry
+# Entry Point
 # ===-----------------------------------------------------------------------===#
 
 
 @gluon.jit
-def attention_kernel(
+def _mha_decode_fp16(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -472,7 +472,7 @@ def attention_kernel(
 
 
 @gluon.jit
-def reduce_kernel(
+def _mha_decode_reduce_fp16(
     mid_o_ptr,
     mid_lse_ptr,
     out_ptr,
@@ -546,11 +546,6 @@ def reduce_kernel(
     output = acc * l_i_recip
     output = output.to(out_ptr.dtype.element_ty)
     cdna4.buffer_store(output, out_ptr, out_base + offs_d)
-
-
-# ===-----------------------------------------------------------------------===#
-# Entry Point
-# ===-----------------------------------------------------------------------===#
 
 
 class LaunchConfig(NamedTuple):
@@ -656,7 +651,7 @@ def gluon_mha_decode_fp16_gfx950(
         dtype=torch.float32,
     )
 
-    attention_kernel[(batch, config.num_kv_heads, config.max_kv_splits)](
+    _mha_decode_fp16[(batch, config.num_kv_heads, config.max_kv_splits)](
         q,
         k_cache,
         v_cache,
@@ -677,7 +672,7 @@ def gluon_mha_decode_fp16_gfx950(
         config.window_left,
         num_warps=1,
     )
-    reduce_kernel[(batch, config.num_q_heads)](
+    _mha_decode_reduce_fp16[(batch, config.num_q_heads)](
         mid_o,
         mid_lse,
         output,
