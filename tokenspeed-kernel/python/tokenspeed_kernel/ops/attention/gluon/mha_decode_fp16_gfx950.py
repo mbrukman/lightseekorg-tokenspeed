@@ -632,7 +632,6 @@ def gluon_mha_decode_fp16_gfx950(
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor:
-    assert not return_lse
     has_sink = sinks is not None
     sink_arg = sinks if sinks is not None else q
     config = get_config(
